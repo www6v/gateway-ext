@@ -686,131 +686,227 @@ flowchart LR
 
 ---
 
-## 11. 数据库与配置管理
+## 11. 预算与花费追踪
 
-### 11.1 数据库 Schema（65+ 表）
+### 11.1 整体架构
 
 ```mermaid
-erDiagram
-    VerificationToken ||--o{ SpendLogs : "generates"
-    TeamTable ||--o{ VerificationToken : "owns"
-    TeamTable ||--o{ TeamMembership : "has"
-    UserTable ||--o{ TeamMembership : "belongs"
-    OrganizationTable ||--o{ TeamTable : "contains"
-    ProxyModelTable ||--o{ SpendLogs : "served by"
-    BudgetTable ||--o{ VerificationToken : "limits"
-    BudgetTable ||--o{ TeamTable : "limits"
-    GuardrailsTable ||--o{ PolicyTable : "used in"
-    PolicyTable ||--o{ PolicyAttachmentTable : "attached"
+flowchart TD
+    REQ["LLM 请求完成"]
+    COST["completion_cost<br/>token 数 × 单价"]
+    HIDDEN["存入 response._hidden_params<br/>response_cost"]
+    HDR["写入响应头<br/>x-litellm-response-cost"]
+    CB["proxy_track_cost_callback<br/>async_log_success_event"]
+    DIMENSIONS["多维度 spend 追踪<br/>key / user / team / org / tag / agent"]
+    RESERVE["预算预留<br/>BudgetReservation"]
+    WRITE["DBSpendUpdateWriter<br/>Redis 缓冲写入"]
+    BG["后台任务 update_spend<br/>每 60s 批量刷写"]
+    PG["PostgreSQL<br/>LiteLLM_SpendLogs"]
+    DAILY["每日聚合<br/>DailyUserSpend / DailyTeamSpend<br/>DailyGlobalSpend / DailyOrgSpend"]
+    ALERT["预算告警<br/>Slack / Email 通知"]
 
-    VerificationToken {
-        string token hashed
-        string user_id
-        string team_id
-        float spend
-        float max_budget
-        int tpm_limit
-        int rpm_limit
-        json aliases
-    }
-    TeamTable {
-        string team_id
-        string team_alias
-        float max_budget
-        json models
-        json members_with_roles
-    }
-    SpendLogs {
-        string request_id
-        string api_key
-        string model
-        int prompt_tokens
-        int completion_tokens
-        float spend
-    }
-    ProxyModelTable {
-        string model_id
-        string model_name
-        json litellm_params
-        json model_info
-        boolean blocked
-    }
+    REQ --> COST
+    COST --> HIDDEN
+    HIDDEN --> HDR
+    HIDDEN --> CB
+    CB --> DIMENSIONS
+    CB --> RESERVE
+    DIMENSIONS --> WRITE
+    WRITE --> BG
+    BG --> PG
+    BG --> DAILY
+    DIMENSIONS --> ALERT
+
+    style COST fill:#fef3c7,stroke:#f59e0b
+    style PG fill:#dbeafe,stroke:#3b82f6
+    style DAILY fill:#dcfce7,stroke:#16a34a
 ```
 
-核心表分类：
+### 11.2 费用计算
 
-| 分类 | 表 |
-|------|-----|
-| 身份与访问 | VerificationToken, UserTable, TeamTable, OrganizationTable, BudgetTable |
-| 模型与路由 | ProxyModelTable, CredentialsTable, AdaptiveRouterState |
-| Spend 追踪 | SpendLogs, DailyUserSpend, DailyGlobalSpend, DailyTeamSpend |
-| 护栏与策略 | GuardrailsTable, PolicyTable, PolicyAttachmentTable |
-| MCP & 工具 | MCPServerTable, ToolTable, SkillsTable |
-| 配置 | Config, CacheConfig, UISettings, SSOConfig |
+费用计算由 `litellm/cost_calculator.py` 中的 `completion_cost()` 完成：
 
-### 11.2 配置管理
-
-**配置优先级**（高到低）：
-
-1. YAML 配置文件（config-owned）
-2. 数据库（`LiteLLM_Config` 表）
-3. 环境变量
-4. 默认值
-
-**热更新机制**：
-
-| 机制 | 说明 |
+| 输入 | 说明 |
 |------|------|
-| Redis Pub/Sub | 配置变更通知所有 Pod（channel: `litellm_proxy.config_change`） |
-| 定期重载 | `model_cost_map_reload_config` 控制周期刷新 |
-| DB 变更触发 | 写入 16+ 表时自动发 Pub/Sub |
+| `prompt_tokens` | 输入 token 数 |
+| `completion_tokens` | 输出 token 数 |
+| `model` | 模型名称 |
+| 价格来源 | 自定义 > `litellm_params` > `model_cost_map` |
 
-### 11.3 数据库连接架构
+计算公式：`cost = input_tokens × input_cost_per_token + output_tokens × output_cost_per_token`
 
-```mermaid
-flowchart LR
-    subgraph Pod["Proxy Pod"]
-        PW["PrismaWrapper<br/>writer"]
-        RPW["RoutingPrismaWrapper<br/>reader"]
-    end
+### 11.3 Spend 追踪维度
 
-    subgraph DB["PostgreSQL"]
-        W["Writer (Primary)"]
-        R["Read Replica"]
-    end
+`_ProxyDBLogger`（`hooks/proxy_track_cost_callback.py`）按以下维度追踪：
 
-    PW -->|写请求| W
-    RPW -->|读请求| R
-    RPW -->|read-after-write| W
-```
+| 维度 | 表 | 说明 |
+|------|-----|------|
+| API Key | `LiteLLM_VerificationToken.spend` | 每个 key 的累计花费 |
+| User | `LiteLLM_UserTable.spend` | 每个内部用户 |
+| Team | `LiteLLM_TeamTable.spend` | 每个团队 |
+| Organization | `LiteLLM_OrganizationTable.spend` | 每个组织 |
+| End User | `LiteLLM_EndUserTable.spend` | 外部终端用户 |
+| Tag | `LiteLLM_TagTable.spend` | 按标签聚合 |
+| Agent | `LiteLLM_AgentsTable.spend` | 按 Agent 聚合 |
 
-- **读写分离**：读走 Read Replica，写走 Writer
-- **Writer-Pinned Client**：保证 read-after-write 一致性
-- **Token Auth**：支持 AWS RDS IAM / Azure Entra ID 短期 token
-- **PgBouncer**：自动检测并适配
+### 11.4 预算预留机制
+
+为防止并发请求导致超支，Proxy 使用预算预留：
+
+1. **请求到达** → 预估费用 → 在 Redis 中预留预算额度
+2. **请求完成** → 实际费用回写 → 释放预留差额
+3. **请求失败** → `BudgetReservationReleaseMiddleware` 释放全部预留
+4. **并发控制** → 预留失败则拒绝请求（429 Too Many Requests）
+
+### 11.5 每日聚合
+
+后台任务定时将 SpendLogs 聚合到日表：
+
+| 日表 | 粒度 |
+|------|------|
+| `LiteLLM_DailyUserSpend` | 每用户 × 每日 × 每模型 |
+| `LiteLLM_DailyTeamSpend` | 每团队 × 每日 |
+| `LiteLLM_DailyGlobalSpend` | 全局 × 每日 |
+| `LiteLLM_DailyOrganizationSpend` | 每组织 × 每日 |
+| `LiteLLM_DailyEndUserSpend` | 每终端用户 × 每日 |
+| `LiteLLM_DailyTagSpend` | 每标签 × 每日 |
+| `LiteLLM_DailyModelUsage` | 每模型 × 每日 × 任务类型 |
+
+### 11.6 预算告警
+
+- **软预算**：达到 80% 时触发告警（Slack / Email），但允许继续
+- **硬预算**：达到 100% 时拒绝请求（429）
+- **周/月报告**：后台任务自动发送花费报告
 
 ---
 
-## 12. 关键函数索引
+## 12. 速率限制与节流
 
-| 函数 | 文件 | 行号 | 说明 |
-|------|------|------|------|
-| `run_server` | `proxy/proxy_cli.py` | 771 | CLI 入口 |
-| `proxy_startup_event` | `proxy/proxy_server.py` | 1398 | Lifespan 启动 |
-| `ProxyConfig.load_config` | `proxy/proxy_server.py` | 6623 | 加载配置 |
-| `chat_completion` | `proxy/proxy_server.py` | 12714 | Chat 端点 |
-| `user_api_key_auth` | `proxy/auth/user_api_key_auth.py` | 4186 | 认证入口 |
-| `user_api_key_auth_builder` | `proxy/auth/user_api_key_auth.py` | 2068 | 认证状态机 |
-| `get_key_object` | `proxy/auth/auth_checks.py` | 4194 | Key 查找 |
-| `common_checks` | `proxy/auth/auth_checks.py` | 1067 | 授权检查 |
-| `base_process_llm_request` | `proxy/common_request_processing.py` | 2726 | 请求处理入口 |
-| `common_processing_pre_call_logic` | `proxy/common_request_processing.py` | 2137 | Pre-call 管线 |
-| `route_request` | `proxy/route_llm_request.py` | 599 | LLM 路由分发 |
-| `async_function_with_fallbacks` | `litellm/router.py` | 8405 | Router fallback |
-| `async_data_generator` | `proxy/proxy_server.py` | 10468 | 流式 SSE 生成 |
-| `handle_llm_api_exception` | `proxy/common_request_processing.py` | 4089 | 错误处理 |
-| `pre_call_hook` | `proxy/utils.py` | 2478 | Hook 编排 |
-| `completion_cost` | `litellm/cost_calculator.py` | - | 费用计算 |
+### 12.1 限流体系总览
+
+```mermaid
+flowchart TD
+    REQ["请求到达"]
+    MW["AdmissionControlMiddleware<br/>全局准入控制<br/>max_in_flight_requests"]
+    AUTH["user_api_key_auth<br/>读取 key 的 tpm/rpm 限制"]
+    HOOK["parallel_request_limiter<br/>并行请求数限制"]
+    DYN["dynamic_rate_limiter<br/>自适应 RPM/TPM"]
+    BUDGET_THROTTLE["budget_throttle<br/>预算超支节流"]
+    BATCH["batch_rate_limiter<br/>批处理准入"]
+    SESSION["max_budget_per_session_limiter<br/>会话预算上限"]
+    MODEL_BUDGET["model_max_budget_limiter<br/>单模型花费上限"]
+    PASS["放行"]
+    REJECT["拒绝 429"]
+
+    REQ --> MW
+    MW -->|超限| REJECT
+    MW --> AUTH
+    AUTH --> HOOK
+    HOOK -->|超限| REJECT
+    HOOK --> DYN
+    DYN -->|超限| REJECT
+    DYN --> BUDGET_THROTTLE
+    BUDGET_THROTTLE -->|超预算| REJECT
+    BUDGET_THROTTLE --> BATCH
+    BATCH --> SESSION
+    SESSION --> MODEL_BUDGET
+    MODEL_BUDGET --> PASS
+
+    style PASS fill:#dcfce7,stroke:#16a34a
+    style REJECT fill:#fee2e2,stroke:#dc2626
+    style MW fill:#fef3c7,stroke:#f59e0b
+```
+
+### 12.2 多层限流机制
+
+| 层 | 机制 | 触发条件 | 文件 |
+|----|------|----------|------|
+| **全局准入** | `max_in_flight_requests` / `max_queued_requests` | 全 Pod 并发超限 | `middleware/admission_control_middleware.py` |
+| **并行请求** | `parallel_request_limiter_v3` | 单 key 并发超限 | `hooks/parallel_request_limiter_v3.py` |
+| **自适应速率** | `dynamic_rate_limiter_v3` | TPM/RPM 动态调整 | `hooks/dynamic_rate_limiter_v3.py` |
+| **预算节流** | `budget_throttle` | 预算接近上限时优雅降级 | `hooks/budget_throttle.py` |
+| **会话预算** | `max_budget_per_session_limiter` | 单会话花费超限 | `hooks/max_budget_per_session_limiter.py` |
+| **模型预算** | `model_max_budget_limiter` | 单模型花费超限 | `hooks/model_max_budget_limiter.py` |
+| **批处理准入** | `batch_rate_limiter` / `batch_enqueued_tokens` | 批处理 token 配额 | `hooks/batch_rate_limiter.py` |
+
+### 12.3 并行请求限制
+
+`parallel_request_limiter_v3.py`（5779 行）是默认的速率限制器：
+
+**工作原理**：
+1. **Pre-call**：`async_pre_call_hook` 检查当前 key 的并行请求数
+2. **获取槽位**：通过 Redis 原子 INCR 计数，超限则拒绝（429）
+3. **Post-call**：`async_log_success_event` 释放槽位（DECR）
+4. **Streaming**：流式结束时释放，客户端断连时释放
+
+**Redis 键结构**：
+```
+global_parallel_rate_limit:{api_key} → 当前并行请求数
+```
+
+### 12.4 TPM / RPM 限制
+
+每个 API Key 可配置 `tpm_limit` 和 `rpm_limit`：
+
+| 限制类型 | 说明 | 检查时机 |
+|----------|------|----------|
+| RPM (Requests Per Minute) | 每分钟请求数上限 | pre_call |
+| TPM (Tokens Per Minute) | 每分钟 token 数上限 | pre_call，按预估 input tokens 计算 |
+
+检查流程：
+1. 从 Redis 读取当前分钟的计数器
+2. `current_rpm + 1 > rpm_limit` → 拒绝
+3. `current_tpm + estimated_input_tokens > tpm_limit` → 拒绝
+4. 通过后预留 token 额度，完成后校正
+
+### 12.5 自适应速率限制
+
+`dynamic_rate_limiter_v3` 基于历史请求模式动态调整限制：
+
+- 监控最近的请求成功率和延迟
+- 当 Provider 返回 429 时自动降低发送速率
+- 逐步恢复（exponential backoff + jitter）
+- 按 model group 独立追踪
+
+### 12.6 Fallback 与限流的交互
+
+当请求被限流时，Proxy 支持 fallback：
+
+```mermaid
+flowchart LR
+    REQ["请求到达"]
+    RL["速率限制检查"]
+    HIT{"超限?"}
+    FB["fallback 到备选模型组"]
+    PASS["放行"]
+    REJECT["429 拒绝"]
+
+    REQ --> RL
+    RL --> HIT
+    HIT -->|否| PASS
+    HIT -->|是| FB
+    FB --> RL
+    FB -->|无备选| REJECT
+
+    style PASS fill:#dcfce7,stroke:#16a34a
+    style REJECT fill:#fee2e2,stroke:#dc2626
+```
+
+fallback 来源：
+- `router.fallbacks`：全局模型 fallback 列表
+- `router_settings.fallbacks`：key/team 级别覆盖
+- `context_window_fallbacks`：上下文窗口不足时切换到更大模型
+- `content_policy_fallbacks`：内容策略拒绝时切换
+
+### 12.7 节流与优雅降级
+
+`budget_throttle` 在预算接近上限时进行优雅降级：
+
+| 阈值 | 行为 |
+|------|------|
+| < 80% 预算 | 正常处理 |
+| 80%-100% | 软告警 + 可选降级到更便宜模型 |
+| > 100% | 硬拒绝（429）或 `max_budget_per_session_limiter` 拦截 |
 
 ---
 
